@@ -1,18 +1,5 @@
 import Airtable from "airtable";
 
-// ---------------------------------------------------------------------------
-// CHANGED FROM THE PREVIOUS VERSION: attendance is now multi-session.
-//
-// The old version assumed one Attendance row per employee per day (find-or-
-// create keyed on date), which meant signing out for lunch and back in the
-// same afternoon overwrote the morning's session. The reference design's
-// "Today's log" and "Attendance history" both clearly show multiple
-// in/out pairs on the same day, so each sign-in now always creates a new
-// row, and "today's status" is derived from whichever row (if any) has no
-// Sign Out Time yet. No Airtable schema change is required — same fields,
-// just no longer assuming uniqueness per day.
-// ---------------------------------------------------------------------------
-
 let _base: Airtable.Base | null = null;
 function base() {
   if (!_base) {
@@ -26,8 +13,22 @@ function base() {
 const Employees = () => base()("Employees");
 const Attendance = () => base()("Attendance");
 const LeaveRequests = () => base()("LeaveRequests");
+const Holidays = () => base()("Holidays");
+const Breaks = () => base()("Breaks");
 
 export type Mode = "Office" | "Remote";
+
+// The Airtable "Mode" single-select only contains "Office" and "Home".
+// Our API key can't create new select options, so we translate at the boundary.
+const AIRTABLE_REMOTE_LABEL = "Home";
+function toAirtableMode(mode: Mode): string {
+  return mode === "Remote" ? AIRTABLE_REMOTE_LABEL : "Office";
+}
+function fromAirtableMode(raw: string | undefined | null): Mode {
+  return raw === AIRTABLE_REMOTE_LABEL || raw === "Remote"
+    ? "Remote"
+    : "Office";
+}
 
 export type Session = {
   id: string;
@@ -35,6 +36,13 @@ export type Session = {
   signInTime: string | null;
   signOutTime: string | null;
   mode: Mode;
+};
+
+export type BreakRecord = {
+  id: string;
+  date: string;
+  startTime: string;
+  endTime: string | null;
 };
 
 export type LeaveType = "Annual" | "Sick" | "Personal";
@@ -69,21 +77,115 @@ export type TeamMember = {
   leaveLabel: string | null;
 };
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+// ---------------------------------------------------------------------------
+// Break rules — shared by server (enforcement) and client (display/alerts).
+// ---------------------------------------------------------------------------
+export const BREAK_RULES = {
+  maxBreaks: 2,
+  maxPerBreakMin: 30,
+  maxTotalMin: 60,
+} as const;
+
+export function breakElapsedMin(b: BreakRecord, nowMs: number) {
+  const end = b.endTime ? new Date(b.endTime).getTime() : nowMs;
+  return Math.max(0, (end - new Date(b.startTime).getTime()) / 60000);
 }
 
-// Counts weekdays inclusive of both ends — matches "5 working days" style
-// labels in the reference design rather than raw calendar day counts.
-export function countWorkingDays(startISO: string, endISO: string) {
-  const start = new Date(startISO);
-  const end = new Date(endISO);
+export function summarizeBreaks(breaks: BreakRecord[], nowMs: number) {
+  const active = breaks.find((b) => !b.endTime) ?? null;
+  const finishedMin = breaks
+    .filter((b) => b.endTime)
+    .reduce((sum, b) => sum + breakElapsedMin(b, nowMs), 0);
+  const activeElapsedMin = active ? breakElapsedMin(active, nowMs) : 0;
+  const usedMin = finishedMin + activeElapsedMin;
+  // Allowance left for the break that is (or would be) running now.
+  const remainingBeforeActiveMin = Math.max(
+    0,
+    BREAK_RULES.maxTotalMin - finishedMin,
+  );
+  const allowedForActiveMin = Math.min(
+    BREAK_RULES.maxPerBreakMin,
+    remainingBeforeActiveMin,
+  );
+  const overrunMin = active
+    ? Math.max(0, activeElapsedMin - allowedForActiveMin)
+    : 0;
+  const countUsed = breaks.length;
+
+  let blockReason: "break_active" | "max_breaks" | "allowance_used" | null =
+    null;
+  if (active) blockReason = "break_active";
+  else if (countUsed >= BREAK_RULES.maxBreaks) blockReason = "max_breaks";
+  else if (remainingBeforeActiveMin < 1) blockReason = "allowance_used";
+
+  return {
+    active,
+    usedMin,
+    activeElapsedMin,
+    allowedForActiveMin,
+    overrunMin,
+    countUsed,
+    canStart: blockReason === null,
+    blockReason,
+  };
+}
+
+export const BREAK_BLOCK_MESSAGES: Record<string, string> = {
+  not_signed_in: "Sign in before starting a break.",
+  break_active: "You're already on a break.",
+  max_breaks: "You've used both of your breaks today.",
+  allowance_used: "Your 1-hour break allowance is used up for today.",
+};
+
+// ---------------------------------------------------------------------------
+// Dates
+// ---------------------------------------------------------------------------
+const TZ = process.env.APP_TIMEZONE || "Asia/Colombo";
+
+// "Today" in the workplace timezone (YYYY-MM-DD). Using UTC here put
+// early-morning sign-ins on the previous day.
+function todayISO() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+}
+
+// Weekdays inclusive of both ends, excluding `holidays`. Uses UTC date math so
+// the result never depends on the machine's timezone.
+export function countWorkingDays(
+  startISO: string,
+  endISO: string,
+  holidays?: Set<string>,
+) {
+  const start = new Date(`${startISO.slice(0, 10)}T00:00:00Z`);
+  const end = new Date(`${endISO.slice(0, 10)}T00:00:00Z`);
   let count = 0;
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    const day = d.getDay();
-    if (day !== 0 && day !== 6) count += 1;
+  for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+    const day = d.getUTCDay();
+    if (day === 0 || day === 6) continue;
+    if (holidays?.has(d.toISOString().slice(0, 10))) continue;
+    count += 1;
   }
   return count;
+}
+
+let holidayCache: { dates: Set<string>; expiresAt: number } | null = null;
+
+// A missing/misnamed Holidays table must not take down the leave page.
+export async function getHolidaySet(): Promise<Set<string>> {
+  if (holidayCache && holidayCache.expiresAt > Date.now())
+    return holidayCache.dates;
+  try {
+    const records = await Holidays().select().all();
+    const dates = new Set(
+      records
+        .map((r) => r.get("Date") as string)
+        .filter((d): d is string => Boolean(d)),
+    );
+    holidayCache = { dates, expiresAt: Date.now() + 5 * 60 * 1000 };
+    return dates;
+  } catch (err) {
+    console.error("getHolidaySet failed — continuing with no holidays:", err);
+    return new Set();
+  }
 }
 
 export const LEAVE_ALLOWANCE: Record<LeaveType, number> = {
@@ -92,10 +194,12 @@ export const LEAVE_ALLOWANCE: Record<LeaveType, number> = {
   Personal: 5,
 };
 
+const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
 export async function findEmployee(email: string): Promise<Employee | null> {
   const records = await Employees()
     .select({
-      filterByFormula: `LOWER({Email}) = LOWER("${email}")`,
+      filterByFormula: `LOWER({Email}) = LOWER("${esc(email)}")`,
       maxRecords: 1,
     })
     .firstPage();
@@ -106,25 +210,20 @@ export async function findEmployee(email: string): Promise<Employee | null> {
     name: r.get("Name") as string,
     email: r.get("Email") as string,
     role: (r.get("Role") as string) || "",
-    defaultMode:
-      ((r.get("Default Mode") as string) === "Home"
-        ? "Remote"
-        : (r.get("Default Mode") as Mode)) || "Office",
+    defaultMode: fromAirtableMode(r.get("Default Mode") as string),
   };
 }
 
 function sessionFromRecord(r: Airtable.Record<Airtable.FieldSet>): Session {
-  const rawMode = r.get("Mode") as string;
   return {
     id: r.id,
     date: r.get("Date") as string,
     signInTime: (r.get("Sign In Time") as string) || null,
     signOutTime: (r.get("Sign Out Time") as string) || null,
-    mode: rawMode === "Home" ? "Remote" : (rawMode as Mode) || "Office",
+    mode: fromAirtableMode(r.get("Mode") as string),
   };
 }
 
-// All of today's sessions for one employee, oldest first — powers "Today's log".
 export async function getTodaySessions(employeeId: string): Promise<Session[]> {
   const records = await Attendance()
     .select({
@@ -135,7 +234,6 @@ export async function getTodaySessions(employeeId: string): Promise<Session[]> {
   return records.map(sessionFromRecord);
 }
 
-// The currently-open session (signed in, not yet out), if any.
 export async function getOpenSession(
   employeeId: string,
 ): Promise<Session | null> {
@@ -147,9 +245,10 @@ export async function signIn(employeeId: string, mode: Mode) {
   const now = new Date().toISOString();
   const created = await Attendance().create({
     EmployeeId: employeeId,
+    Employee: [employeeId],
     Date: todayISO(),
     "Sign In Time": now,
-    Mode: mode,
+    Mode: toAirtableMode(mode), // <-- the fix: "Remote" is stored as "Home"
   });
   return created.id;
 }
@@ -159,7 +258,6 @@ export async function signOut(recordId: string) {
   await Attendance().update(recordId, { "Sign Out Time": now });
 }
 
-// Sessions before today, newest first — used for History and the week total.
 export async function getPastSessions(
   employeeId: string,
   limit = 60,
@@ -174,6 +272,57 @@ export async function getPastSessions(
   return records.map(sessionFromRecord);
 }
 
+// ---------------------------------------------------------------------------
+// Breaks
+// ---------------------------------------------------------------------------
+export class BreaksUnavailableError extends Error {}
+
+// strict = true for anything that enforces rules (break-start): if we can't read
+// the breaks, we must NOT assume there are none. Display paths stay lenient.
+export async function getTodayBreaks(
+  employeeId: string,
+  opts: { strict?: boolean } = {},
+): Promise<BreakRecord[]> {
+  try {
+    const records = await Breaks()
+      .select({
+        filterByFormula: `AND({EmployeeId} = "${employeeId}", IS_SAME({Date}, "${todayISO()}", "day"))`,
+        sort: [{ field: "Break Start", direction: "asc" }],
+      })
+      .all();
+    return records.map((r) => ({
+      id: r.id,
+      date: r.get("Date") as string,
+      startTime: r.get("Break Start") as string,
+      endTime: (r.get("Break End") as string) || null,
+    }));
+  } catch (err) {
+    console.error(
+      "getTodayBreaks failed (is the 'Breaks' table created and the token allowed?):",
+      err,
+    );
+    if (opts.strict)
+      throw new BreaksUnavailableError("Breaks table unavailable");
+    return [];
+  }
+}
+export async function startBreak(employeeId: string) {
+  const created = await Breaks().create({
+    EmployeeId: employeeId,
+    Employee: [employeeId],
+    Date: todayISO(),
+    "Break Start": new Date().toISOString(),
+  });
+  return created.id;
+}
+
+export async function endBreak(recordId: string) {
+  await Breaks().update(recordId, { "Break End": new Date().toISOString() });
+}
+
+// ---------------------------------------------------------------------------
+// Team
+// ---------------------------------------------------------------------------
 export async function getTeamToday(): Promise<TeamMember[]> {
   const today = todayISO();
 
@@ -276,6 +425,7 @@ export async function createLeaveRequest(
 ) {
   await LeaveRequests().create({
     EmployeeId: employeeId,
+    Employee: [employeeId],
     Email: employeeEmail,
     "Start Date": startDate,
     "End Date": endDate,
@@ -289,13 +439,16 @@ export async function createLeaveRequest(
 export async function getLeaveRequests(
   employeeId: string,
 ): Promise<LeaveRecord[]> {
-  const records = await LeaveRequests()
-    .select({
-      filterByFormula: `{EmployeeId} = "${employeeId}"`,
-      sort: [{ field: "Start Date", direction: "desc" }],
-      maxRecords: 20,
-    })
-    .firstPage();
+  const [records, holidays] = await Promise.all([
+    LeaveRequests()
+      .select({
+        filterByFormula: `{EmployeeId} = "${employeeId}"`,
+        sort: [{ field: "Start Date", direction: "desc" }],
+        maxRecords: 20,
+      })
+      .firstPage(),
+    getHolidaySet(),
+  ]);
 
   return records.map((r) => {
     const startDate = r.get("Start Date") as string;
@@ -308,7 +461,9 @@ export async function getLeaveRequests(
       id: r.id,
       startDate,
       endDate,
-      workingDays: halfDayPeriod ? 0.5 : countWorkingDays(startDate, endDate),
+      workingDays: halfDayPeriod
+        ? 0.5
+        : countWorkingDays(startDate, endDate, holidays),
       type: (r.get("Type") as LeaveType) || "Annual",
       reason: (r.get("Reason") as string) || "",
       status: (r.get("Status") as LeaveStatus) || "Pending",

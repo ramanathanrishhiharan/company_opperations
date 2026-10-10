@@ -1,16 +1,35 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Home as HomeIcon, Building2, Power, ArrowRight } from "lucide-react";
+import toast from "react-hot-toast";
+import { Home as HomeIcon, Building2, Power, ArrowRight, Coffee } from "lucide-react";
 import { useSession } from "@/components/SessionContext";
-import { Mode, Session, LeaveRecord, TeamMember, LEAVE_ALLOWANCE, countWorkingDays } from "@/lib/airtable";
+import {
+  Mode,
+  Session,
+  LeaveRecord,
+  TeamMember,
+  LEAVE_ALLOWANCE,
+  BREAK_RULES,
+  breakElapsedMin,
+  summarizeBreaks,
+} from "@/lib/airtable";
 
 function formatTime(iso: string) {
   return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 function formatDate(iso: string) {
   return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+// Round first, then split — avoids "0h 60m" when minutes are e.g. 59.6.
+function fmtHM(min: number) {
+  const total = Math.round(min);
+  return `${Math.floor(total / 60)}h ${(total % 60).toString().padStart(2, "0")}m`;
+}
+function fmtClock(min: number) {
+  const s = Math.floor(min * 60);
+  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
 }
 
 function startOfWeek() {
@@ -34,13 +53,29 @@ function sumMinutes(sessions: { signInTime: string | null; signOutTime: string |
 
 const WEEKLY_TARGET_MIN = 40 * 60;
 const DAY_TARGET_MIN = 8 * 60;
+const DANGER = "var(--danger, #c0392b)";
 
 export default function TodayPage() {
-  const { employee, todaySessions, openSession, pastSessions, busy, signIn, signOut } = useSession();
+  const {
+    employee,
+    todaySessions,
+    openSession,
+    pastSessions,
+    todayBreaks,
+    activeBreak,
+    busy,
+    signIn,
+    signOut,
+    startBreak,
+    endBreak,
+  } = useSession();
   const [pendingMode, setPendingMode] = useState<Mode>("Office");
   const [now, setNow] = useState(() => Date.now());
   const [team, setTeam] = useState<TeamMember[] | null>(null);
   const [leaveRequests, setLeaveRequests] = useState<LeaveRecord[] | null>(null);
+  const alerted = useRef<Set<string>>(new Set());
+
+  const breakInfo = summarizeBreaks(todayBreaks, now);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- sync local default once employee loads
@@ -55,13 +90,30 @@ export default function TodayPage() {
   useEffect(() => {
     fetch("/api/team")
       .then((r) => r.json())
-      .then((d) => setTeam(d.team));
+      .then((d) => setTeam(d.team ?? []))
+      .catch(() => setTeam([]));
     if (employee?.email) {
       fetch(`/api/leave?email=${encodeURIComponent(employee.email)}`)
         .then((r) => r.json())
-        .then((d) => setLeaveRequests(d.requests));
+        .then((d) => setLeaveRequests(d.requests ?? []))
+        .catch(() => setLeaveRequests([]));
     }
   }, [employee?.email]);
+
+  // Break alerts: a heads-up at 5 minutes left, and an alert when time is up.
+  useEffect(() => {
+    if (!activeBreak) return;
+    const left = breakInfo.allowedForActiveMin - breakInfo.activeElapsedMin;
+    const warnKey = `${activeBreak.id}:warn`;
+    const limitKey = `${activeBreak.id}:limit`;
+    if (left <= 0 && !alerted.current.has(limitKey)) {
+      alerted.current.add(limitKey);
+      toast.error("Your break time is up — please resume work.", { duration: 10000 });
+    } else if (left > 0 && left <= 5 && !alerted.current.has(warnKey)) {
+      alerted.current.add(warnKey);
+      toast("5 minutes left on your break.", { icon: "⏳", duration: 6000 });
+    }
+  }, [activeBreak, breakInfo.activeElapsedMin, breakInfo.allowedForActiveMin]);
 
   if (!employee) {
     return (
@@ -91,13 +143,14 @@ export default function TodayPage() {
   const remainingWeekMin = Math.max(0, WEEKLY_TARGET_MIN - weekMinutes);
 
   const workingNow = (team ?? []).filter((m) => m.status === "signed_in");
-  const signedInCount = (team ?? []).filter((m) => m.status === "signed_in").length;
+  const signedInCount = workingNow.length;
 
   const pendingLeave = (leaveRequests ?? []).find((r) => r.status === "Pending");
+  // Same rule as the Leave page (holidays + half days via r.workingDays).
   const annualUsed = (leaveRequests ?? [])
     .filter((r) => r.type === "Annual" && r.status !== "Declined")
-    .reduce((sum, r) => sum + countWorkingDays(r.startDate, r.endDate), 0);
-  const annualLeft = LEAVE_ALLOWANCE.Annual - annualUsed;
+    .reduce((sum, r) => sum + r.workingDays, 0);
+  const annualLeft = Math.max(0, LEAVE_ALLOWANCE.Annual - annualUsed);
 
   function handlePress() {
     if (isSignedIn) {
@@ -108,6 +161,12 @@ export default function TodayPage() {
   }
 
   const cardActiveClass = isSignedIn ? "status-card dark" : "status-card";
+
+  const breakOver = breakInfo.overrunMin > 0;
+  const breakPct = activeBreak
+    ? Math.min(100, (breakInfo.activeElapsedMin / Math.max(1, breakInfo.allowedForActiveMin)) * 100)
+    : 0;
+  const totalOver = breakInfo.usedMin > BREAK_RULES.maxTotalMin;
 
   return (
     <div>
@@ -129,7 +188,13 @@ export default function TodayPage() {
                 <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
                   <span className={`dot ${isSignedIn ? "dot-success dot-pulse" : "dot-neutral"}`} />
                   <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase" }} className="status-caption">
-                    {isSignedIn ? "Currently signed in" : todaySessions.length > 0 ? "Signed out" : "Not signed in"}
+                    {isSignedIn
+                      ? activeBreak
+                        ? "Signed in · on break"
+                        : "Currently signed in"
+                      : todaySessions.length > 0
+                      ? "Signed out"
+                      : "Not signed in"}
                   </span>
                 </div>
                 {isSignedIn ? (
@@ -139,7 +204,7 @@ export default function TodayPage() {
                   </p>
                 ) : (
                   <p style={{ margin: 0, fontFamily: "var(--font-display)", fontSize: 26, fontWeight: 700 }}>
-                    {Math.floor(todayMinutesTotal / 60)}h {Math.round(todayMinutesTotal % 60).toString().padStart(2, "0")}m logged
+                    {fmtHM(todayMinutesTotal)} logged
                   </p>
                 )}
                 <p className="status-caption" style={{ margin: "6px 0 0", fontSize: 13 }}>
@@ -181,6 +246,82 @@ export default function TodayPage() {
             </button>
           </div>
 
+          {/* ---------------- Breaks ---------------- */}
+          <div className="card" style={{ padding: 18, marginTop: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Coffee size={16} />
+                <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700 }}>Breaks</h3>
+              </div>
+              <span style={{ fontSize: 12, color: totalOver ? DANGER : "var(--text-secondary)", fontWeight: totalOver ? 700 : 500 }}>
+                {Math.round(breakInfo.usedMin)} / {BREAK_RULES.maxTotalMin} min · {breakInfo.countUsed} of {BREAK_RULES.maxBreaks} used
+              </span>
+            </div>
+
+            {activeBreak ? (
+              <div style={{ marginTop: 14 }}>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                  <span
+                    style={{
+                      fontFamily: "var(--font-display)",
+                      fontSize: 30,
+                      fontWeight: 700,
+                      color: breakOver ? DANGER : undefined,
+                    }}
+                  >
+                    {fmtClock(breakInfo.activeElapsedMin)}
+                  </span>
+                  <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
+                    of {Math.round(breakInfo.allowedForActiveMin)}:00 allowed
+                  </span>
+                </div>
+                <div className="progress-track" style={{ marginTop: 8 }}>
+                  <div className="progress-fill" style={{ width: `${breakPct}%`, background: breakOver ? DANGER : "var(--accent)" }} />
+                </div>
+                <p style={{ margin: "8px 0 0", fontSize: 12, color: breakOver ? DANGER : "var(--text-secondary)", fontWeight: breakOver ? 600 : 400 }}>
+                  {breakOver
+                    ? `Break limit exceeded by ${fmtClock(breakInfo.overrunMin)} — please resume work.`
+                    : `${fmtClock(breakInfo.allowedForActiveMin - breakInfo.activeElapsedMin)} left on this break.`}
+                </p>
+                <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={endBreak} disabled={busy}>
+                  {busy ? "Working…" : "End break"}
+                </button>
+              </div>
+            ) : (
+              <div style={{ marginTop: 14 }}>
+                <button
+                  className="btn btn-primary"
+                  onClick={startBreak}
+                  disabled={busy || !isSignedIn || !breakInfo.canStart}
+                >
+                  {busy ? "Working…" : "Start break"}
+                </button>
+                <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--text-tertiary)" }}>
+                  {!isSignedIn
+                    ? "Sign in to take a break."
+                    : breakInfo.blockReason === "max_breaks"
+                    ? "You've used both breaks today."
+                    : breakInfo.blockReason === "allowance_used"
+                    ? "Your 1-hour allowance is used up."
+                    : `Up to ${BREAK_RULES.maxBreaks} breaks of ${BREAK_RULES.maxPerBreakMin} min, ${BREAK_RULES.maxTotalMin} min in total.`}
+                </p>
+              </div>
+            )}
+
+            {todayBreaks.length > 0 && (
+              <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+                {todayBreaks.map((b, i) => (
+                  <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "var(--text-secondary)" }}>
+                    <span>
+                      Break {i + 1}: {formatTime(b.startTime)} → {b.endTime ? formatTime(b.endTime) : "now"}
+                    </span>
+                    <span style={{ fontFamily: "var(--font-display)" }}>{Math.round(breakElapsedMin(b, now))} min</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div className="section-header">
             <h2>Today&rsquo;s log</h2>
             <Link href="/history" className="link-row">
@@ -202,23 +343,18 @@ export default function TodayPage() {
         <div className="side-col">
           <div className="card mini-card">
             <p className="mini-card-label">This week</p>
-            <p className="mini-card-value">
-              {Math.floor(weekMinutes / 60)}h {Math.round(weekMinutes % 60).toString().padStart(2, "0")}m
-            </p>
+            <p className="mini-card-value">{fmtHM(weekMinutes)}</p>
             <p className="mini-card-sub">
-              {weekDays} day{weekDays === 1 ? "" : "s"} worked · {Math.floor(todayMinutesTotal / 60)}h{" "}
-              {Math.round(todayMinutesTotal % 60).toString().padStart(2, "0")}m today
+              {weekDays} day{weekDays === 1 ? "" : "s"} worked · {fmtHM(todayMinutesTotal)} today
             </p>
             <div className="mini-card-divider" />
             <div className="mini-card-stat-row">
               <span>Weekly target</span>
-              <span className="mono">{Math.floor(WEEKLY_TARGET_MIN / 60)}h 00m</span>
+              <span className="mono">{fmtHM(WEEKLY_TARGET_MIN)}</span>
             </div>
             <div className="mini-card-stat-row">
               <span>Remaining</span>
-              <span className="mono">
-                {Math.floor(remainingWeekMin / 60)}h {Math.round(remainingWeekMin % 60).toString().padStart(2, "0")}m
-              </span>
+              <span className="mono">{fmtHM(remainingWeekMin)}</span>
             </div>
           </div>
 
@@ -295,8 +431,7 @@ function SessionRow({ session, now }: { session: Session; now: number }) {
         {(() => {
           if (!session.signInTime) return "";
           const end = session.signOutTime ? new Date(session.signOutTime).getTime() : now;
-          const min = Math.max(0, (end - new Date(session.signInTime).getTime()) / 60000);
-          return `${Math.floor(min / 60)}h ${Math.round(min % 60).toString().padStart(2, "0")}m`;
+          return fmtHM(Math.max(0, (end - new Date(session.signInTime).getTime()) / 60000));
         })()}
       </span>
     </div>

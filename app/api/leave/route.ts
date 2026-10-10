@@ -1,5 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
-import { findEmployee, createLeaveRequest, getLeaveRequests, LeaveType, HalfDayPeriod } from "@/lib/airtable";
+import {
+  findEmployee,
+  createLeaveRequest,
+  getLeaveRequests,
+  getHolidaySet,
+  countWorkingDays,
+  LeaveType,
+  HalfDayPeriod,
+} from "@/lib/airtable";
 
 const VALID_TYPES: LeaveType[] = ["Annual", "Sick", "Personal"];
 
@@ -33,6 +41,15 @@ export async function POST(req: NextRequest) {
   }
   if (halfDayPeriod && startDate !== endDate) {
     return NextResponse.json({ error: "Half-day leave must be a single day" }, { status: 400 });
+  }
+  if (!halfDayPeriod) {
+    const holidays = await getHolidaySet();
+    if (countWorkingDays(startDate, endDate, holidays) === 0) {
+      return NextResponse.json(
+        { error: "That range doesn't include any working days — check if it's a weekend or public holiday." },
+        { status: 400 }
+      );
+    }
   }
 
   const employee = await findEmployee(email);
